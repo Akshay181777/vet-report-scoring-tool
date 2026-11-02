@@ -1,20 +1,25 @@
 
-# Python environment and cache
+# Python environment
 .venv/
+venv/
 __pycache__/
-*.py[cod]
+*.pyc
 
-# API keys and secrets
+# API keys and environment variables
 .env
 .env.*
 
-# Confidential Vetology data and generated files
+# Vetology datasets and reports
 *.xlsx
 *.xls
-*.xlsm
 *.csv
-*.parquet
-output/
+*.jsonl
 
-# Local editor files
+# Generated outputs
+*.log
+output/
+results/
+
+# IDE files
 .vscode/
+.idea/

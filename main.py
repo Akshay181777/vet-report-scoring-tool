@@ -1,273 +1,447 @@
 
-"""Generate a confusion matrix for 100 selected cases.
+"""Groq report classification and Matrix 2 generation.
 
-Predictions come from Sheet1 of the original workbook.
-Ground-truth labels come from the supplied ground-truth workbook.
-All calculations run locally; no AI API is called.
+Run:
+python main.py "CanineThorax.xlsx" "CanineThorax.xlsx" --limit 100 -o "CanineThorax_Groq_Matrix2.xlsx"
+
+Successful case predictions are saved immediately to a JSONL checkpoint.
+If the script stops, run the same command again; completed cases are skipped.
 """
 
 import argparse
-import re
+import json
+import os
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
+from groq import Groq
+from json_repair import repair_json
+
+from confusion_matrix import calculate_matrix, normalize_case_id
 
 
-def normalize_name(name):
-    """Ignore capitalization, spaces, and punctuation in column names."""
-    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+def find_col(df, names):
+    """Find a dataframe column while ignoring spaces and underscores."""
+    lookup = {
+        str(column).lower().replace(" ", "").replace("_", ""): column
+        for column in df.columns
+    }
 
-
-def normalize_case_id(series):
-    """Standardize CaseIDs so IDs match between Excel files."""
-    return (
-        series.astype(str)
-        .str.strip()
-        .str.replace(r"\.0$", "", regex=True)
-    )
-
-
-def normalize_label(value):
-    """Convert positive/abnormal labels to 1 and negative/normal to 0."""
-    if pd.isna(value):
-        return None
-
-    label = str(value).strip().lower()
-
-    if label in {"positive", "abnormal", "yes", "y", "1", "true"}:
-        return 1
-
-    if label in {"negative", "normal", "no", "n", "0", "false"}:
-        return 0
+    for name in names:
+        key = name.lower().replace(" ", "").replace("_", "")
+        if key in lookup:
+            return lookup[key]
 
     return None
 
 
-def is_metadata_column(column):
-    """Identify columns that are not condition labels."""
-    metadata = {
-        "caseid",
-        "findingsoriginalradiologistreport",
-        "conclusionsoriginalradiologistreport",
-        "recommendationsoriginalradiologistreport",
-    }
-    return normalize_name(column) in metadata
+def parse_groq_json(content):
+    """Parse valid JSON or attempt to repair malformed JSON from Groq."""
+    if not content or not content.strip():
+        raise ValueError("Groq returned an empty response.")
+
+    content = content.strip()
+
+    # Remove Markdown code fences, if the model included them.
+    if content.startswith("```"):
+        lines = content.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+
+    # First try standard JSON parsing.
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        print("The response was not valid JSON. Trying JSON repair...")
+        repaired = repair_json(content)
+        result = json.loads(repaired)
+
+    if not isinstance(result, dict):
+        raise ValueError("Groq response must be a JSON object.")
+
+    return result
 
 
-def create_confusion_matrix(prediction_file, ground_truth_file):
-    """Calculate metrics for every ground-truth condition."""
-    # Sheet1 has the predictions for all 21 conditions.
-    predictions = pd.read_excel(
-        prediction_file,
-        sheet_name="Sheet1",
+def classify_report(client, config, report):
+    """Make one Groq request and validate all condition classifications."""
+    conditions = config["conditions"]
+
+    definitions = "\n".join(
+        f"- {condition}: {definition}"
+        for condition, definition in conditions.items()
     )
 
-    # The supplied ground-truth workbook contains the selected 100 cases.
-    ground_truth = pd.read_excel(
-        ground_truth_file,
-        sheet_name=0,
+    system = "\n".join(config["global_instructions"])
+
+    user = (
+        f"Condition definitions:\n{definitions}\n\n"
+        f"Radiology report:\n{report}\n\n"
+        "Return one JSON object only. Include every condition name "
+        "as a top-level key. Each value must be an object with "
+        '"classification" set to exactly "Positive" or "Negative", '
+        'and "reason" set to a short explanation. '
+        "Do not use Markdown fences or text outside the JSON object."
     )
 
-    # Ensure both workbooks have a CaseID column.
-    if "CaseID" not in predictions.columns:
-        raise ValueError("Sheet1 has no CaseID column.")
+    # Exactly one API request per case. No automatic retries.
+    response = client.chat.completions.create(
+        model=config["model"],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=config.get("temperature", 0),
+        max_completion_tokens=config.get("max_completion_tokens", 3000),
+    )
 
-    if "CaseID" not in ground_truth.columns:
-        raise ValueError("The ground-truth sheet has no CaseID column.")
+    content = response.choices[0].message.content
+    result = parse_groq_json(content)
 
-    predictions = predictions.dropna(subset=["CaseID"]).copy()
-    ground_truth = ground_truth.dropna(subset=["CaseID"]).copy()
+    clean = {}
 
-    predictions["CaseID"] = normalize_case_id(predictions["CaseID"])
-    ground_truth["CaseID"] = normalize_case_id(ground_truth["CaseID"])
+    for condition in conditions:
+        if condition not in result:
+            raise ValueError(
+                f"Groq response is missing condition: {condition}"
+            )
 
-    # The ground-truth workbook defines the cases to evaluate.
-    selected_ids = set(ground_truth["CaseID"])
-    predictions = predictions[
-        predictions["CaseID"].isin(selected_ids)
-    ].copy()
+        item = result[condition]
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"Invalid response structure for condition: {condition}"
+            )
 
-    # Check duplicate IDs only among the selected cases.
-    if ground_truth["CaseID"].duplicated().any():
-        raise ValueError(
-            "The ground-truth workbook contains duplicate CaseIDs."
-        )
+        label = str(item.get("classification", "")).strip().title()
+        if label not in {"Positive", "Negative"}:
+            raise ValueError(
+                f"Invalid classification for {condition}: {label!r}"
+            )
 
-    if predictions["CaseID"].duplicated().any():
-        raise ValueError(
-            "Duplicate prediction CaseIDs exist among the selected cases."
-        )
+        clean[condition] = {
+            "classification": label,
+            "reason": str(item.get("reason", "")).strip(),
+        }
 
-    prediction_ids = set(predictions["CaseID"])
-    unmatched_ids = sorted(selected_ids - prediction_ids)
+    return clean
 
-    # Find prediction columns by normalized condition name.
-    prediction_lookup = {
-        normalize_name(column): column
-        for column in predictions.columns
-        if not is_metadata_column(column)
+
+def load_checkpoint(checkpoint_path):
+    """Load completed predictions from the JSONL checkpoint file."""
+    completed = {}
+
+    if not checkpoint_path.exists():
+        return completed
+
+    with checkpoint_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+
+            try:
+                record = json.loads(line)
+                case_id = str(record["CaseID"])
+                result = record["result"]
+
+                if isinstance(result, dict):
+                    completed[case_id] = result
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                print(
+                    f"Warning: ignoring invalid checkpoint line "
+                    f"{line_number}: {exc}"
+                )
+
+    return completed
+
+
+def append_checkpoint(checkpoint_path, case_id, result):
+    """Persist one successful case immediately."""
+    record = {
+        "CaseID": str(case_id),
+        "result": result,
     }
 
-    # Keep every condition in ground truth, even if a prediction
-    # column cannot be found.
-    condition_pairs = []
-    for truth_column in ground_truth.columns:
-        if is_metadata_column(truth_column):
+    with checkpoint_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def build_output_rows(reports, conditions, completed):
+    """Build prediction and detail rows from all completed checkpoint cases."""
+    prediction_rows = []
+    detail_rows = []
+
+    for _, row in reports.iterrows():
+        case_id = str(normalize_case_id(row["CaseID"]))
+
+        if case_id not in completed:
             continue
 
-        prediction_column = prediction_lookup.get(
-            normalize_name(truth_column)
-        )
-        condition_pairs.append((prediction_column, truth_column))
+        result = completed[case_id]
+        wide_row = {"CaseID": row["CaseID"]}
 
-    # Match cases using CaseID.
-    # Only include columns needed for the confusion matrix.
-    prediction_data = predictions[["CaseID"]].copy()
-    truth_data = ground_truth[["CaseID"]].copy()
+        for condition in conditions:
+            item = result[condition]
+            classification = item["classification"]
 
-    for index, (prediction_column, truth_column) in enumerate(
-        condition_pairs
-    ):
-        if prediction_column is None:
-            # Preserve the condition, but don't invent predictions.
-            prediction_data[f"pred_{index}"] = None
-        else:
-            prediction_data[f"pred_{index}"] = predictions[
-                prediction_column
-            ].map(normalize_label)
+            wide_row[condition] = classification
+            detail_rows.append(
+                {
+                    "CaseID": row["CaseID"],
+                    "Condition": condition,
+                    "Classification": classification,
+                    "Short reason": item.get("reason", ""),
+                }
+            )
 
-        truth_data[f"truth_{index}"] = ground_truth[
-            truth_column
-        ].map(normalize_label)
+        prediction_rows.append(wide_row)
 
-    matched = prediction_data.merge(
-        truth_data,
-        on="CaseID",
-        how="inner",
-        validate="one_to_one",
-    )
-
-    results = []
-
-    for index, (_, truth_column) in enumerate(condition_pairs):
-        prediction_values = matched[f"pred_{index}"]
-        truth_values = matched[f"truth_{index}"]
-
-        # Ground-truth totals are counted independently of predictions.
-        valid_truth = truth_values.notna()
-        positive_truth = int((truth_values[valid_truth] == 1).sum())
-        negative_truth = int((truth_values[valid_truth] == 0).sum())
-
-        # Confusion-matrix counts require both labels to be available.
-        valid_pairs = prediction_values.notna() & truth_values.notna()
-        pred = prediction_values[valid_pairs].astype(int)
-        actual = truth_values[valid_pairs].astype(int)
-
-        tp = int(((pred == 1) & (actual == 1)).sum())
-        fn = int(((pred == 0) & (actual == 1)).sum())
-        tn = int(((pred == 0) & (actual == 0)).sum())
-        fp = int(((pred == 1) & (actual == 0)).sum())
-
-        check = tp + fn + tn + fp
-
-        sensitivity = (
-            tp / (tp + fn) if (tp + fn) > 0 else None
-        )
-        specificity = (
-            tn / (tn + fp) if (tn + fp) > 0 else None
-        )
-
-        results.append({
-            "condition": truth_column,
-            "TP": tp,
-            "FN": fn,
-            "TN": tn,
-            "FP": fp,
-            "Sensitivity": sensitivity,
-            "Specificity": specificity,
-            "Check": check,
-            "Positive Ground Truth": positive_truth,
-            "Negative Ground Truth": negative_truth,
-            "Ground Truth Check": positive_truth + negative_truth,
-        })
-
-    return pd.DataFrame(results), len(matched), unmatched_ids
+    return pd.DataFrame(prediction_rows), pd.DataFrame(detail_rows)
 
 
 def main():
-    """Read file paths from the command line and save the output."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Generate a confusion matrix for selected ground-truth cases."
-        )
+        description="Generate Groq predictions and Matrix 2."
     )
+
     parser.add_argument(
-        "prediction_file",
-        help="Original Excel workbook containing Sheet1 predictions",
+        "input_file",
+        help="Workbook containing original radiologist reports",
     )
     parser.add_argument(
         "ground_truth_file",
-        help="Excel workbook containing selected ground-truth cases",
+        help="Workbook containing manual Gold Standard labels",
     )
+    parser.add_argument("--prompts", default="prompts.json")
+    parser.add_argument("--limit", type=int, default=100)
     parser.add_argument(
         "-o",
         "--output",
-        default="my_confusion_matrix_100.xlsx",
-        help="Output Excel filename",
+        default="CanineThorax_Groq_Matrix2.xlsx",
     )
 
     args = parser.parse_args()
 
-    prediction_path = Path(args.prediction_file)
-    truth_path = Path(args.ground_truth_file)
+    for filename in (
+        args.input_file,
+        args.ground_truth_file,
+        args.prompts,
+    ):
+        if not Path(filename).is_file():
+            raise SystemExit(f"File not found: {filename}")
+
+    load_dotenv()
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise SystemExit("GROQ_API_KEY not found in .env")
+
+    config = json.loads(
+        Path(args.prompts).read_text(encoding="utf-8")
+    )
+    conditions = list(config["conditions"])
+
+    reports = pd.read_excel(args.input_file, sheet_name=0)
+    truth = pd.read_excel(args.ground_truth_file, sheet_name=0)
+
+    report_case_col = find_col(reports, ["CaseID"])
+    if report_case_col is None:
+        raise SystemExit("Input workbook needs a CaseID column.")
+
+    reports = (
+        reports.rename(columns={report_case_col: "CaseID"})
+        .dropna(subset=["CaseID"])
+        .head(args.limit)
+        .copy()
+    )
+
+    report_cols = {
+        "Findings": find_col(
+            reports,
+            ["Findings (original radiologist report)", "Findings"],
+        ),
+        "Conclusions": find_col(
+            reports,
+            ["Conclusions (original radiologist report)", "Conclusions"],
+        ),
+        "Recommendations": find_col(
+            reports,
+            [
+                "Recommendations (original radiologist report)",
+                "Recommendations",
+            ],
+        ),
+    }
+    report_cols = {
+        label: column
+        for label, column in report_cols.items()
+        if column is not None
+    }
+
+    if not report_cols:
+        raise SystemExit(
+            "No Findings/Conclusions/Recommendations report text columns found."
+        )
+
+    truth_case_col = find_col(truth, ["CaseID"])
+    if truth_case_col is None:
+        raise SystemExit("Gold Standard workbook needs a CaseID column.")
+
+    truth = truth.rename(columns={truth_case_col: "CaseID"}).copy()
+
+    # The checkpoint is stored beside the requested output workbook.
     output_path = Path(args.output)
+    checkpoint_path = output_path.with_name(
+        output_path.stem + "_checkpoint.jsonl"
+    )
 
-    if not prediction_path.is_file():
-        raise SystemExit(f"Prediction workbook not found: {prediction_path}")
-
-    if not truth_path.is_file():
-        raise SystemExit(f"Ground-truth workbook not found: {truth_path}")
-
-    # All calculations are local. No API calls or API credits are used.
-    try:
-        result, matched_count, unmatched_ids = create_confusion_matrix(
-            prediction_path,
-            truth_path,
-        )
-    except Exception as error:
-        raise SystemExit(f"Could not create confusion matrix: {error}")
-
-    # Save every condition in the output workbook.
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        result.to_excel(
-            writer,
-            sheet_name="Confusion Matrix",
-            index=False,
+    completed = load_checkpoint(checkpoint_path)
+    if completed:
+        print(
+            f"Loaded {len(completed)} completed cases from "
+            f"{checkpoint_path.name}."
         )
 
-        worksheet = writer.sheets["Confusion Matrix"]
-        worksheet.freeze_panes = "A2"
-        worksheet.auto_filter.ref = worksheet.dimensions
+    client = Groq(api_key=api_key)
 
-        # Display sensitivity and specificity as percentages.
-        for column_name in ["Sensitivity", "Specificity"]:
-            column_index = result.columns.get_loc(column_name) + 1
+    for index, (_, row) in enumerate(reports.iterrows(), start=1):
+        original_case_id = row["CaseID"]
+        case_key = str(normalize_case_id(original_case_id))
 
-            for row_index in range(2, len(result) + 2):
-                worksheet.cell(
-                    row=row_index,
-                    column=column_index,
-                ).number_format = "0.00%"
+        if case_key in completed:
+            print(
+                f"Skipping CaseID {original_case_id} "
+                f"({index}/{len(reports)}) - already saved."
+            )
+            continue
 
-        worksheet.column_dimensions["A"].width = 36
+        sections = [
+            f"{label}: {row[column]}"
+            for label, column in report_cols.items()
+            if pd.notna(row[column]) and str(row[column]).strip()
+        ]
+        report = "\n\n".join(sections)
 
-    print(f"Ground-truth cases: {len(pd.read_excel(truth_path))}")
-    print(f"Cases matched: {matched_count}")
-    print(f"Conditions included: {len(result)}")
-    print(f"Output saved to: {output_path.resolve()}")
+        if not report:
+            raise SystemExit(
+                f"CaseID {original_case_id} has no report text."
+            )
 
-    if unmatched_ids:
-        print(f"CaseIDs without predictions: {unmatched_ids}")
+        print(
+            f"Calling Groq for CaseID {original_case_id} "
+            f"({index}/{len(reports)})"
+        )
+
+        try:
+            result = classify_report(client, config, report)
+        except Exception as exc:
+            print(
+                f"\nStopped at CaseID {original_case_id}. "
+                "No automatic retry was made."
+            )
+            print(f"Reason: {exc}")
+            print(
+                f"Previously completed cases are saved in: "
+                f"{checkpoint_path.resolve()}"
+            )
+            print(
+                "Run the same command again after resolving the issue; "
+                "saved cases will be skipped."
+            )
+            raise SystemExit(1) from exc
+
+        # Save immediately after successful classification.
+        append_checkpoint(checkpoint_path, case_key, result)
+        completed[case_key] = result
+
+        print(
+            f"Saved CaseID {original_case_id} "
+            f"({len(completed)} completed in checkpoint)."
+        )
+
+    # Build the final workbook using all completed predictions.
+    predictions, details = build_output_rows(
+        reports, conditions, completed
+    )
+
+    if predictions.empty:
+        raise SystemExit("No completed predictions are available.")
+
+    predictions["CaseID"] = normalize_case_id(predictions["CaseID"])
+    truth["CaseID"] = normalize_case_id(truth["CaseID"])
+
+    selected_ids = set(predictions["CaseID"])
+    truth_selected = truth[truth["CaseID"].isin(selected_ids)].copy()
+
+    matrix, matched, missing, extra = calculate_matrix(
+        predictions,
+        truth_selected,
+        conditions,
+    )
+
+    qa = pd.DataFrame(
+        [
+            ["Reports classified", len(predictions)],
+            ["Conditions", len(conditions)],
+            [
+                "Expected prediction labels",
+                len(predictions) * len(conditions),
+            ],
+            ["Actual prediction labels", len(details)],
+            ["CaseIDs matched", matched],
+            [
+                "Gold Standard IDs missing predictions",
+                ", ".join(missing) or "None",
+            ],
+            ["Extra prediction IDs", ", ".join(extra) or "None"],
+            ["Groq model", config["model"]],
+            ["Checkpoint file", checkpoint_path.name],
+        ],
+        columns=["QA check", "Result"],
+    )
+
+    with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
+        predictions.to_excel(
+            writer, sheet_name="Sheet1", index=False
+        )
+        details.to_excel(
+            writer, sheet_name="Detailed Predictions", index=False
+        )
+        matrix.to_excel(
+            writer, sheet_name="Matrix 2", index=False
+        )
+        qa.to_excel(
+            writer, sheet_name="QA", index=False
+        )
+
+        for worksheet in writer.sheets.values():
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+
+            for cells in worksheet.columns:
+                width = max(
+                    len(str(cell.value or "")) for cell in cells
+                ) + 2
+                worksheet.column_dimensions[
+                    cells[0].column_letter
+                ].width = min(max(width, 12), 55)
+
+        matrix_ws = writer.sheets["Matrix 2"]
+        for column_name in ("Sensitivity", "Specificity"):
+            if column_name in matrix.columns:
+                column_index = matrix.columns.get_loc(column_name) + 1
+                for row_index in range(2, len(matrix) + 2):
+                    matrix_ws.cell(
+                        row_index, column_index
+                    ).number_format = "0.00%"
+
+    print("\nFinished.")
+    print("Output:", output_path.resolve())
+    print("Matrix 2 matched cases:", matched)
+    print("Checkpoint:", checkpoint_path.resolve())
 
 
 if __name__ == "__main__":
